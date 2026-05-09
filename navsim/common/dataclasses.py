@@ -438,7 +438,7 @@ class Scene:
     def _build_map_api(cls, map_name: str) -> AbstractMap:
         """Helper classmethod to load map api from name."""
         assert map_name in MAP_LOCATIONS, f"The map name {map_name} is invalid, must be in {MAP_LOCATIONS}"
-        return get_maps_api(NUPLAN_MAPS_ROOT, "nuplan-maps-v1.0", map_name)
+        return get_maps_api( os.environ.get("NUPLAN_MAPS_ROOT"), "nuplan-maps-v1.0", map_name)
 
     @classmethod
     def _build_annotations(cls, scene_frame: Dict) -> Annotations:
