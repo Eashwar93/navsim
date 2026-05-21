@@ -271,7 +271,7 @@ class MetricCacheProcessor:
 
     def _build_file_path(self, scenario: NavSimScenario) -> pathlib.Path:
         return (
-            (self._cache_path / scenario.log_name / scenario.scenario_type / scenario.token / "metric_cache.pkl")
+            (pathlib.Path("") / scenario.log_name / scenario.scenario_type / scenario.token / "metric_cache.pkl")
             if self._cache_path
             else None
         )
@@ -279,10 +279,10 @@ class MetricCacheProcessor:
     def compute_and_save_metric_cache(self, scenario: NavSimScenario) -> Optional[CacheMetadataEntry]:
         file_name = self._build_file_path(scenario)
         assert file_name is not None, "Cache path can not be None for saving cache."
-        if file_name.exists() and not self._force_feature_computation:
-            return CacheMetadataEntry(file_name)
+        if (self._cache_path / file_name).exists() and not self._force_feature_computation:
+            return CacheMetadataEntry((self._cache_path / file_name))
         metric_cache = self.compute_metric_cache(scenario)
-        metric_cache.dump()
+        metric_cache.dump(parent_path=self._cache_path)
         return CacheMetadataEntry(metric_cache.file_path)
 
     def _extract_ego_future_trajectory(self, scenario: NavSimScenario) -> Trajectory:
