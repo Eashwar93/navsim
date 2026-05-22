@@ -55,5 +55,5 @@ class MetricCache:
         # TODO: check if file_path must really be pickled
         parent_path = Path("") if parent_path is None else Path(parent_path)
         pickle_object = pickle.dumps(self, protocol=pickle.HIGHEST_PROTOCOL)
-        file_path = (parent_path / self.file_path) if parent_path else self.file_path
+        file_path = parent_path / self.file_path
         save_buffer(file_path, lzma.compress(pickle_object, preset=0))
