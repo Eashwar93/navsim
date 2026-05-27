@@ -50,8 +50,10 @@ class MetricCache:
 
     map_parameters: MapParameters
 
-    def dump(self) -> None:
+    def dump(self, parent_path=None) -> None:
         """Dump metric cache to pickle with lzma compression."""
         # TODO: check if file_path must really be pickled
+        parent_path = Path("") if parent_path is None else Path(parent_path)
         pickle_object = pickle.dumps(self, protocol=pickle.HIGHEST_PROTOCOL)
-        save_buffer(self.file_path, lzma.compress(pickle_object, preset=0))
+        file_path = parent_path / self.file_path
+        save_buffer(file_path, lzma.compress(pickle_object, preset=0))

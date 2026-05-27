@@ -312,8 +312,8 @@ class MetricCacheLoader:
         metadata_dir = cache_path / "metadata"
         metadata_file = [file for file in metadata_dir.iterdir() if ".csv" in str(file)][0]
         with open(str(metadata_file), "r") as f:
-            cache_paths = f.read().splitlines()[1:]
-        metric_cache_dict = {cache_path.split("/")[-2]: cache_path for cache_path in cache_paths}
+            relative_paths = f.read().splitlines()[1:]
+        metric_cache_dict = {relative_path.split("/")[-2]: (cache_path / relative_path).as_posix() for relative_path in relative_paths}
         return metric_cache_dict
 
     @property
