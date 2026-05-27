@@ -309,7 +309,7 @@ class MetricCacheLoader:
         :param cache_path: directory of cache folder
         :return: dictionary of token and file path
         """
-        metadata_dir = cache_path  / "metadata"
+        metadata_dir = cache_path / "metadata"
         metadata_file = [file for file in metadata_dir.iterdir() if ".csv" in str(file)][0]
         with open(str(metadata_file), "r") as f:
             relative_paths = f.read().splitlines()[1:]
