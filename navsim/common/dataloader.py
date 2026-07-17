@@ -1,16 +1,81 @@
 from __future__ import annotations
 
+import functools
 import lzma
 import pickle
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Iterator, List, Tuple
 
+import numpy as np
+import torch
 from tqdm import tqdm
 
 from navsim.common.dataclasses import AgentInput, Scene, SceneFilter, SensorConfig
 from navsim.planning.metric_caching.metric_cache import MetricCache
 
 FrameList = List[Dict[str, Any]]
+
+
+class TokenSerializedDict(Mapping):
+    """Read-only ``Mapping[token, FrameList]`` that stores its values as one flat
+    byte buffer instead of a live graph of many small Python objects.
+
+    Motivation: when a forked ``DataLoader`` worker accesses a Python object, it
+    increments that object's refcount -- a *write* -- which forces the kernel to
+    copy the shared page. Iterating a large nested structure (``scene_frames_dicts``
+    is tens of thousands of frame dicts) therefore gradually converts copy-on-write
+    shared memory into a private per-worker copy, and RAM grows without bound until
+    the box OOMs.
+
+    Here each value is pickled once (in the parent, before workers fork) into a
+    single ``torch.uint8`` tensor, with an int64 offset array marking boundaries.
+    Workers touch only that one shared tensor (read-only) plus fixed-width numeric
+    arrays; each lookup ``pickle.loads`` a *fresh* short-lived ``FrameList`` in
+    worker-private memory that is freed after the sample. Nothing accumulates.
+
+    The public interface (``d[token]``, ``in``, ``len``, ``keys/values/items``)
+    matches the plain ``dict`` it replaces, so call sites need no change.
+
+    See https://ppwwyyxx.com/blog/2022/Demystify-RAM-Usage-in-Multiprocess-DataLoader/
+    """
+
+    def __init__(self, mapping: Dict[str, FrameList]):
+        tokens = list(mapping.keys())
+        # token -> flat index. Read-only after construction; a lookup increfs only
+        # the small int value (a few MB total across all tokens), never the payload.
+        self._token_to_index: Dict[str, int] = {t: i for i, t in enumerate(tokens)}
+        # Fixed-width unicode array: tolist() yields fresh str objects, so listing
+        # keys never dirties shared pages the way list(dict.keys()) would.
+        self._tokens: np.ndarray = np.asarray(tokens)
+
+        buffers = [
+            np.frombuffer(pickle.dumps(mapping[t], protocol=pickle.HIGHEST_PROTOCOL), dtype=np.uint8)
+            for t in tokens
+        ]
+        # Cumulative *end* offsets; slice i is [addr[i-1], addr[i]) with addr[-1]:=0.
+        self._addr: torch.Tensor = torch.from_numpy(
+            np.cumsum([len(b) for b in buffers], dtype=np.int64)
+        )
+        self._data: torch.Tensor = torch.from_numpy(
+            np.concatenate(buffers) if buffers else np.empty(0, dtype=np.uint8)
+        )
+
+    def __getitem__(self, token: str) -> FrameList:
+        i = self._token_to_index[token]  # raises KeyError for unknown token, like dict
+        lo = 0 if i == 0 else int(self._addr[i - 1])
+        hi = int(self._addr[i])
+        return pickle.loads(memoryview(self._data[lo:hi].numpy()))
+
+    def __contains__(self, token: object) -> bool:
+        # Override the ABC default, which would call __getitem__ and deserialize.
+        return token in self._token_to_index
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._tokens.tolist())
+
+    def __len__(self) -> int:
+        return len(self._token_to_index)
 
 
 def filter_scenes(data_path: Path, scene_filter: SceneFilter) -> Tuple[Dict[str, FrameList], List[str]]:
@@ -128,7 +193,12 @@ class SceneLoader:
         :param sensor_config: dataclass for sensor loading specification, defaults to no sensors
         """
 
-        self.scene_frames_dicts, stage1_scenes_final_frames_tokens = filter_scenes(data_path, scene_filter)
+        raw_scene_frames_dicts, stage1_scenes_final_frames_tokens = filter_scenes(data_path, scene_filter)
+        # Serialize the per-token frame data into one shared buffer so forked
+        # DataLoader workers cannot privatize it via copy-on-write. See
+        # TokenSerializedDict. The raw graph is released once wrapped.
+        self.scene_frames_dicts = TokenSerializedDict(raw_scene_frames_dicts)
+        del raw_scene_frames_dicts
         self._synthetic_sensor_path = synthetic_sensor_path
         self._original_sensor_path = original_sensor_path
         self._scene_filter = scene_filter
@@ -148,10 +218,14 @@ class SceneLoader:
             self.synthetic_scenes = {}
             self.synthetic_scenes_tokens = set()
 
-    @property
+    @functools.cached_property
     def tokens(self) -> List[str]:
         """
         :return: list of scene identifiers for loading.
+
+        Cached: the underlying collections are immutable after ``__init__``, and
+        rebuilding this list per access (it was called once per sample via the
+        membership asserts) was both an O(N) cost and a copy-on-write hazard.
         """
         return list(self.scene_frames_dicts.keys()) + list(self.synthetic_scenes.keys())
 
@@ -230,7 +304,7 @@ class SceneLoader:
         :param token: scene identifier string.
         :return: scene dataclass
         """
-        assert token in self.tokens
+        assert token in self.scene_frames_dicts or token in self.synthetic_scenes
         if token in self.synthetic_scenes:
             return Scene.load_from_disk(
                 file_path=self.synthetic_scenes[token][0],
@@ -252,7 +326,7 @@ class SceneLoader:
         :param token: scene identifier string.
         :return: agent input dataclass
         """
-        assert token in self.tokens
+        assert token in self.scene_frames_dicts or token in self.synthetic_scenes
         if token in self.synthetic_scenes:
             return Scene.load_from_disk(
                 file_path=self.synthetic_scenes[token][0],
