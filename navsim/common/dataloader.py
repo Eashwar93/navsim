@@ -18,21 +18,29 @@ FrameList = List[Dict[str, Any]]
 
 
 class TokenSerializedDict(Mapping):
-    """Read-only ``Mapping[token, FrameList]`` that stores its values as one flat
-    byte buffer instead of a live graph of many small Python objects.
+    """Read-only ``Mapping[token, FrameList]`` that stores frame data as flat byte
+    buffers instead of a live graph of many small Python objects.
 
-    Motivation: when a forked ``DataLoader`` worker accesses a Python object, it
-    increments that object's refcount -- a *write* -- which forces the kernel to
-    copy the shared page. Iterating a large nested structure (``scene_frames_dicts``
-    is tens of thousands of frame dicts) therefore gradually converts copy-on-write
-    shared memory into a private per-worker copy, and RAM grows without bound until
-    the box OOMs.
+    Two problems are solved together:
 
-    Here each value is pickled once (in the parent, before workers fork) into a
-    single ``torch.uint8`` tensor, with an int64 offset array marking boundaries.
-    Workers touch only that one shared tensor (read-only) plus fixed-width numeric
-    arrays; each lookup ``pickle.loads`` a *fresh* short-lived ``FrameList`` in
-    worker-private memory that is freed after the sample. Nothing accumulates.
+    1. **Copy-on-write privatisation.** When a forked ``DataLoader`` worker accesses
+       a Python object it increments that object's refcount -- a *write* -- which
+       forces the kernel to copy the shared page. Iterating a large nested structure
+       therefore gradually converts copy-on-write shared memory into a private
+       per-worker copy, and RAM grows until the box OOMs. Here workers touch only
+       shared ``torch`` tensors (read-only) plus fixed-width numeric arrays; each
+       lookup ``pickle.loads`` a *fresh*, short-lived ``FrameList`` in worker-private
+       memory that is freed after the sample, so nothing accumulates.
+
+    2. **Overlapping-window duplication.** With ``frame_interval < num_frames`` the
+       scene windows overlap, so one physical frame belongs to several windows. The
+       raw ``dict`` stored those windows as lists of *shared references* to the same
+       frame objects, costing memory proportional to the *unique* frames. Naively
+       pickling each window independently would duplicate every shared frame (~5x on
+       navtrain), inflating resident RAM several-fold. Instead we serialize each
+       *unique* frame once (keyed by its frame token) into a frame table, and store
+       each window as the list of frame-table indices that compose it -- restoring
+       the sharing while keeping the copy-on-write-safe byte buffer.
 
     The public interface (``d[token]``, ``in``, ``len``, ``keys/values/items``)
     matches the plain ``dict`` it replaces, so call sites need no change.
@@ -42,30 +50,57 @@ class TokenSerializedDict(Mapping):
 
     def __init__(self, mapping: Dict[str, FrameList]):
         tokens = list(mapping.keys())
-        # token -> flat index. Read-only after construction; a lookup increfs only
-        # the small int value (a few MB total across all tokens), never the payload.
+        # window token -> flat index. Read-only after construction.
         self._token_to_index: Dict[str, int] = {t: i for i, t in enumerate(tokens)}
         # Fixed-width unicode array: tolist() yields fresh str objects, so listing
         # keys never dirties shared pages the way list(dict.keys()) would.
         self._tokens: np.ndarray = np.asarray(tokens)
 
-        buffers = [
-            np.frombuffer(pickle.dumps(mapping[t], protocol=pickle.HIGHEST_PROTOCOL), dtype=np.uint8)
-            for t in tokens
-        ]
-        # Cumulative *end* offsets; slice i is [addr[i-1], addr[i]) with addr[-1]:=0.
-        self._addr: torch.Tensor = torch.from_numpy(
-            np.cumsum([len(b) for b in buffers], dtype=np.int64)
+        frame_table: Dict[str, int] = {}  # frame token -> row in the frame buffer
+        frame_buffers: List[np.ndarray] = []  # unique-frame pickles, in row order
+        win_frame_ids: List[int] = []  # flat frame-table indices for all windows
+        win_end = np.empty(len(tokens), dtype=np.int64)  # cumulative end into win_frame_ids
+
+        cursor = 0
+        for wi, wtoken in enumerate(tokens):
+            frame_list = mapping[wtoken]
+            for frame in frame_list:
+                ftoken = frame["token"]  # frame tokens are globally unique
+                fi = frame_table.get(ftoken)
+                if fi is None:
+                    fi = len(frame_table)
+                    frame_table[ftoken] = fi
+                    frame_buffers.append(
+                        np.frombuffer(pickle.dumps(frame, protocol=pickle.HIGHEST_PROTOCOL), dtype=np.uint8)
+                    )
+                win_frame_ids.append(fi)
+            cursor += len(frame_list)
+            win_end[wi] = cursor
+
+        # Windows: flat int32 index stream + cumulative end offsets per window.
+        self._win_addr: torch.Tensor = torch.from_numpy(win_end)
+        self._win_frames: torch.Tensor = torch.from_numpy(
+            np.asarray(win_frame_ids, dtype=np.int32) if win_frame_ids else np.empty(0, dtype=np.int32)
         )
-        self._data: torch.Tensor = torch.from_numpy(
-            np.concatenate(buffers) if buffers else np.empty(0, dtype=np.uint8)
+        # Frame table: concatenated unique-frame pickles + cumulative end offsets.
+        self._frame_addr: torch.Tensor = torch.from_numpy(
+            np.cumsum([len(b) for b in frame_buffers], dtype=np.int64)
+        )
+        self._frame_data: torch.Tensor = torch.from_numpy(
+            np.concatenate(frame_buffers) if frame_buffers else np.empty(0, dtype=np.uint8)
         )
 
+    def _frame(self, fi: int) -> Dict[str, Any]:
+        lo = 0 if fi == 0 else int(self._frame_addr[fi - 1])
+        hi = int(self._frame_addr[fi])
+        return pickle.loads(memoryview(self._frame_data[lo:hi].numpy()))
+
     def __getitem__(self, token: str) -> FrameList:
-        i = self._token_to_index[token]  # raises KeyError for unknown token, like dict
-        lo = 0 if i == 0 else int(self._addr[i - 1])
-        hi = int(self._addr[i])
-        return pickle.loads(memoryview(self._data[lo:hi].numpy()))
+        wi = self._token_to_index[token]  # raises KeyError for unknown token, like dict
+        lo = 0 if wi == 0 else int(self._win_addr[wi - 1])
+        hi = int(self._win_addr[wi])
+        # Rebuild the window as a fresh list of freshly-deserialized frames.
+        return [self._frame(int(fi)) for fi in self._win_frames[lo:hi].tolist()]
 
     def __contains__(self, token: object) -> bool:
         # Override the ABC default, which would call __getitem__ and deserialize.
