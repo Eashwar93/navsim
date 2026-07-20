@@ -38,7 +38,7 @@ class TokenSerializedDict(Mapping):
        frame objects, costing memory proportional to the *unique* frames. Naively
        pickling each window independently would duplicate every shared frame (~5x on
        navtrain), inflating resident RAM several-fold. Instead we serialize each
-       *unique* frame once (keyed by its frame token) into a frame table, and store
+       *unique* frame once (keyed by object identity) into a frame table, and store
        each window as the list of frame-table indices that compose it -- restoring
        the sharing while keeping the copy-on-write-safe byte buffer.
 
@@ -56,7 +56,7 @@ class TokenSerializedDict(Mapping):
         # keys never dirties shared pages the way list(dict.keys()) would.
         self._tokens: np.ndarray = np.asarray(tokens)
 
-        frame_table: Dict[str, int] = {}  # frame token -> row in the frame buffer
+        frame_table: Dict[int, int] = {}  # id(frame) -> row in the frame buffer
         frame_buffers: List[np.ndarray] = []  # unique-frame pickles, in row order
         win_frame_ids: List[int] = []  # flat frame-table indices for all windows
         win_end = np.empty(len(tokens), dtype=np.int64)  # cumulative end into win_frame_ids
@@ -65,11 +65,19 @@ class TokenSerializedDict(Mapping):
         for wi, wtoken in enumerate(tokens):
             frame_list = mapping[wtoken]
             for frame in frame_list:
-                ftoken = frame["token"]  # frame tokens are globally unique
-                fi = frame_table.get(ftoken)
+                # Dedup by object identity, not by frame["token"]. Overlapping windows
+                # (frame_interval < num_frames) share the *same* frame object -- that is
+                # the sharing this table is here to preserve -- while distinct scenes are
+                # distinct objects. Frame tokens are NOT globally unique: synthetic scenes
+                # (e.g. SimScale augmentations) reuse a token across variants that have
+                # different sensor data, so keying by token would collapse them and serve
+                # one variant's frame in place of another's. mapping is held live for the
+                # whole build, so id() values are stable here.
+                key = id(frame)
+                fi = frame_table.get(key)
                 if fi is None:
                     fi = len(frame_table)
-                    frame_table[ftoken] = fi
+                    frame_table[key] = fi
                     frame_buffers.append(
                         np.frombuffer(pickle.dumps(frame, protocol=pickle.HIGHEST_PROTOCOL), dtype=np.uint8)
                     )
