@@ -511,11 +511,17 @@ class Scene:
                 sensor_names=sensor_names,
             )
 
-            lidar = Lidar.from_paths(
-                sensor_blobs_path=sensor_blobs_path,
-                lidar_path=Path(scene_dict_list[frame_idx]["lidar_path"]),
-                sensor_names=sensor_names,
-            )
+            # Synthetic scenes (e.g. SimScale) ship camera data only, with
+            # lidar_path set to None. AgentInput.from_scene_dict_list already
+            # guards this; mirror it here so full Scene loading works too.
+            if scene_dict_list[frame_idx]["lidar_path"]:
+                lidar = Lidar.from_paths(
+                    sensor_blobs_path=sensor_blobs_path,
+                    lidar_path=Path(scene_dict_list[frame_idx]["lidar_path"]),
+                    sensor_names=sensor_names,
+                )
+            else:
+                lidar = None
 
             frame = Frame(
                 token=scene_dict_list[frame_idx]["token"],
