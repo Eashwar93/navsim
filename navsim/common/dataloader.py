@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import functools
+import logging
 import lzma
+import os
 import pickle
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -14,7 +17,33 @@ from tqdm import tqdm
 from navsim.common.dataclasses import AgentInput, Scene, SceneFilter, SensorConfig
 from navsim.planning.metric_caching.metric_cache import MetricCache
 
+logger = logging.getLogger(__name__)
+
 FrameList = List[Dict[str, Any]]
+
+
+def _is_tmpfs(path: Path) -> bool:
+    """Return True if ``path`` lives on a RAM-backed filesystem (tmpfs/ramfs).
+
+    Used to warn when the serialized-frame mmap would land back in anonymous RAM,
+    which would silently defeat the whole point of memory-mapping it.
+    """
+    try:
+        resolved = str(path.resolve())
+        best_mount, best_fstype = "", ""
+        with open("/proc/mounts") as mounts:
+            for line in mounts:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mount, fstype = parts[1], parts[2]
+                # Longest matching mount prefix wins (handles nested mounts).
+                if resolved == mount or resolved.startswith(mount.rstrip("/") + "/"):
+                    if len(mount) > len(best_mount):
+                        best_mount, best_fstype = mount, fstype
+        return best_fstype in ("tmpfs", "ramfs")
+    except OSError:
+        return False
 
 
 class TokenSerializedDict(Mapping):
@@ -32,6 +61,16 @@ class TokenSerializedDict(Mapping):
        lookup ``pickle.loads`` a *fresh*, short-lived ``FrameList`` in worker-private
        memory that is freed after the sample, so nothing accumulates.
 
+       The frame blob itself is held in a memory-mapped file rather than an in-process
+       tensor, so those (multi-GB) bytes are *file-backed* page cache instead of
+       anonymous RAM. Under a ``MemoryMax`` cgroup with swap disabled, anonymous pages
+       cannot be reclaimed and force an OOM kill, whereas file-backed pages are dropped
+       under pressure and re-read from disk (fast on NVMe). The file is unlinked right
+       after mapping: on Linux the inode stays live while the mapping is open, so the
+       blob is genuinely ephemeral -- reclaimed on process exit or crash, with no
+       atexit handler and no stale files. Forked workers inherit the same mapping and
+       share one page cache.
+
     2. **Overlapping-window duplication.** With ``frame_interval < num_frames`` the
        scene windows overlap, so one physical frame belongs to several windows. The
        raw ``dict`` stored those windows as lists of *shared references* to the same
@@ -48,7 +87,7 @@ class TokenSerializedDict(Mapping):
     See https://ppwwyyxx.com/blog/2022/Demystify-RAM-Usage-in-Multiprocess-DataLoader/
     """
 
-    def __init__(self, mapping: Dict[str, FrameList]):
+    def __init__(self, mapping: Dict[str, FrameList], serialized_mmap_dir: Optional[Path] = None):
         tokens = list(mapping.keys())
         # window token -> flat index. Read-only after construction.
         self._token_to_index: Dict[str, int] = {t: i for i, t in enumerate(tokens)}
@@ -90,18 +129,54 @@ class TokenSerializedDict(Mapping):
         self._win_frames: torch.Tensor = torch.from_numpy(
             np.asarray(win_frame_ids, dtype=np.int32) if win_frame_ids else np.empty(0, dtype=np.int32)
         )
-        # Frame table: concatenated unique-frame pickles + cumulative end offsets.
+        # Frame table: cumulative end offsets (small, kept in RAM) + the concatenated
+        # unique-frame pickles (large, memory-mapped from a file -- see _build_frame_mmap).
         self._frame_addr: torch.Tensor = torch.from_numpy(
             np.cumsum([len(b) for b in frame_buffers], dtype=np.int64)
         )
-        self._frame_data: torch.Tensor = torch.from_numpy(
-            np.concatenate(frame_buffers) if frame_buffers else np.empty(0, dtype=np.uint8)
+        self._frame_data: np.ndarray = self._build_frame_mmap(frame_buffers, serialized_mmap_dir)
+
+    @staticmethod
+    def _build_frame_mmap(frame_buffers: List[np.ndarray], serialized_mmap_dir: Optional[Path]) -> np.ndarray:
+        """Write the concatenated frame pickles to a file and return a read-only mmap.
+
+        The file is unlinked immediately: the open mapping keeps the inode alive (POSIX),
+        so the bytes stay readable -- and inherited by forked workers -- while the space
+        is reclaimed automatically once every mapping is dropped (process exit or crash).
+        Directory resolution: explicit arg -> ``NAVSIM_FRAME_MMAP_DIR`` -> system tempdir;
+        it must be on a real disk, not tmpfs, or the mapping is just anonymous RAM again.
+        """
+        total = int(sum(len(b) for b in frame_buffers))
+        if total == 0:
+            return np.empty(0, dtype=np.uint8)
+
+        resolved = Path(
+            serialized_mmap_dir or os.environ.get("NAVSIM_FRAME_MMAP_DIR") or tempfile.gettempdir()
         )
+        resolved.mkdir(parents=True, exist_ok=True)
+        if _is_tmpfs(resolved):
+            logger.warning(
+                "Serialized-frame mmap dir %s is on a tmpfs/ramfs filesystem: the blob "
+                "will be RAM-backed, defeating the memory saving. Point "
+                "NAVSIM_FRAME_MMAP_DIR at a real disk (e.g. an NVMe mount).",
+                resolved,
+            )
+
+        fd, path = tempfile.mkstemp(dir=str(resolved), suffix=".navsim_frames")
+        try:
+            with os.fdopen(fd, "wb", closefd=True) as f:
+                for buffer in frame_buffers:
+                    f.write(memoryview(buffer))
+            mmap = np.memmap(path, dtype=np.uint8, mode="r", shape=(total,))
+        finally:
+            os.unlink(path)
+        logger.info("Serialized %.2f GB of frame data to an mmap under %s", total / 1e9, resolved)
+        return mmap
 
     def _frame(self, fi: int) -> Dict[str, Any]:
         lo = 0 if fi == 0 else int(self._frame_addr[fi - 1])
         hi = int(self._frame_addr[fi])
-        return pickle.loads(memoryview(self._frame_data[lo:hi].numpy()))
+        return pickle.loads(memoryview(self._frame_data[lo:hi]))
 
     def __getitem__(self, token: str) -> FrameList:
         wi = self._token_to_index[token]  # raises KeyError for unknown token, like dict
@@ -226,6 +301,7 @@ class SceneLoader:
         synthetic_sensor_path: Path = None,
         synthetic_scenes_path: Path = None,
         sensor_config: SensorConfig = SensorConfig.build_no_sensors(),
+        serialized_mmap_dir: Optional[Path] = None,
     ):
         """
         Initializes the scene data loader.
@@ -234,13 +310,16 @@ class SceneLoader:
         :param original_sensor_path: root directory of sensor  (original)
         :param scene_filter: dataclass for scene filtering specification
         :param sensor_config: dataclass for sensor loading specification, defaults to no sensors
+        :param serialized_mmap_dir: directory for the memory-mapped frame blob; must be on
+            a real disk (not tmpfs). Falls back to ``NAVSIM_FRAME_MMAP_DIR`` then tempdir.
         """
 
         raw_scene_frames_dicts, stage1_scenes_final_frames_tokens = filter_scenes(data_path, scene_filter)
-        # Serialize the per-token frame data into one shared buffer so forked
-        # DataLoader workers cannot privatize it via copy-on-write. See
-        # TokenSerializedDict. The raw graph is released once wrapped.
-        self.scene_frames_dicts = TokenSerializedDict(raw_scene_frames_dicts)
+        # Serialize the per-token frame data into one shared, memory-mapped buffer so
+        # forked DataLoader workers cannot privatize it via copy-on-write and the bytes
+        # stay file-backed rather than anonymous RAM. See TokenSerializedDict. The raw
+        # graph is released once wrapped.
+        self.scene_frames_dicts = TokenSerializedDict(raw_scene_frames_dicts, serialized_mmap_dir=serialized_mmap_dir)
         del raw_scene_frames_dicts
         self._synthetic_sensor_path = synthetic_sensor_path
         self._original_sensor_path = original_sensor_path
