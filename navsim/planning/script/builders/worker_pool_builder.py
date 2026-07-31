@@ -7,8 +7,7 @@ from nuplan.planning.utils.multithreading.worker_parallel import SingleMachinePa
 from nuplan.planning.utils.multithreading.worker_pool import WorkerPool
 from nuplan.planning.utils.multithreading.worker_sequential import Sequential
 from omegaconf import DictConfig
-from py123d.common.execution.process_pool_executor import ProcessPoolExecutor
-from py123d.common.execution import Executor
+from py123d.common.execution import Executor, ProcessPoolExecutor
 
 logger = logging.getLogger(__name__)
 
