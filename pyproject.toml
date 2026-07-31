@@ -61,7 +61,8 @@ dependencies = [
     "tensorboard>=2.16.2",
     "protobuf==4.25.3",
     "notebook",
-    "timm"
+    "timm",
+    "py123d"
 ]
 
 [project.urls]
