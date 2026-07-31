@@ -25,6 +25,9 @@ from navsim.planning.simulation.planner.pdm_planner.utils.pdm_geometry_utils imp
     convert_absolute_to_relative_se2_array,
 )
 
+from nav123d.api import SceneAPI, ArrowSensorAgentAPI
+from py123d.datatypes import CameraID, LidarID, ModalityType
+
 NAVSIM_INTERVAL_LENGTH: float = 0.5
 OPENSCENE_DATA_ROOT = os.environ.get("OPENSCENE_DATA_ROOT")
 NUPLAN_MAPS_ROOT = os.environ.get("NUPLAN_MAPS_ROOT")
@@ -255,6 +258,84 @@ class AgentInput:
                     scene_dict_list[frame_idx].lidar
             )
 
+        return AgentInput(ego_statuses, cameras, lidars)
+
+    @classmethod
+    def map_agent_api_to_navsim_ego_status(cls, agent_api: ArrowSensorAgentAPI, frame_idx: int) -> EgoStatus:
+        """
+        Map to navsim ego status using Py123D agent API.
+        :param ego_status_123D: 123D ego status object
+        :return: navsim ego status
+        """
+        ego_state_se3 = agent_api.get_modality_at_iteration(frame_idx, ModalityType.EGO_STATE_SE3)
+        dynamic_state_se3 = ego_state_se3.dynamic_state_se3
+        ego_pose = ego_state_se3.center_se3.array
+        ego_velocity = dynamic_state_se3.velocity_2d.array
+        ego_acceleration = dynamic_state_se3.acceleration_2d.array
+        driving_command = np.zeros(4, dtype=np.float32)
+        driving_command[1] = 1.0  # index 0: left, 1: straight, 2: left, 3: unknown
+
+        return EgoStatus(
+            ego_pose=ego_pose,
+            ego_velocity=ego_velocity,
+            ego_acceleration=ego_acceleration,
+            driving_command=driving_command,
+        )
+
+    @classmethod
+    def map_agent_api_to_navsim_cameras(cls, agent_api: ArrowSensorAgentAPI, frame_idx: int) -> Cameras:
+        """
+        Map to navsim cameras using Py123D agent API.
+        :param camera_123D: 123D Camera object
+        :return: navsim cameras
+        """
+        return Cameras(
+            cam_f0=agent_api.get_modality_at_iteration(frame_idx, ModalityType.CAMERA, CameraID.PCAM_F0),
+            cam_l0=agent_api.get_modality_at_iteration(frame_idx, ModalityType.CAMERA, CameraID.PCAM_L0),
+            cam_l1=agent_api.get_modality_at_iteration(frame_idx, ModalityType.CAMERA, CameraID.PCAM_L1),
+            cam_l2=agent_api.get_modality_at_iteration(frame_idx, ModalityType.CAMERA, CameraID.PCAM_L2),
+            cam_r0=agent_api.get_modality_at_iteration(frame_idx, ModalityType.CAMERA, CameraID.PCAM_R0),
+            cam_r1=agent_api.get_modality_at_iteration(frame_idx, ModalityType.CAMERA, CameraID.PCAM_R1),
+            cam_r2=agent_api.get_modality_at_iteration(frame_idx, ModalityType.CAMERA, CameraID.PCAM_R2),
+            cam_b0=agent_api.get_modality_at_iteration(frame_idx, ModalityType.CAMERA, CameraID.PCAM_B0),
+        )
+
+    @classmethod
+    def map_agent_api_to_navsim_lidar(cls, agent_api: ArrowSensorAgentAPI, frame_idx: int) -> Lidar:
+        """
+        Map to navsim lidar using Py123D agent API.
+        :param agent_api: Py123D agent API
+        :param frame_idx: frame index
+        :return: navsim lidar
+        """
+        return Lidar(
+            lidar_pc=agent_api.get_modality_at_iteration(frame_idx, ModalityType.LIDAR, LidarID.LIDAR_MERGED)
+        )
+
+    @classmethod
+    def from_scene_api_list(
+        cls,
+        scene_api_list: List[SceneAPI],
+        ) -> AgentInput:
+        """
+        Load agent input from scene API list.
+        :param scene_api_list: list of scene APIs (in logs).
+        :return: agent input dataclass
+        """
+        # assert len(scene_api_list) > 0, "Scene list is empty!"
+        log_dir = scene_api_list._log_dir
+        scene_metadata = scene_api_list.get_scene_metadata()
+
+        agent_api = ArrowSensorAgentAPI(log_dir=log_dir, scene_metadata=scene_metadata)
+
+        ego_statuses: List[EgoStatus] = []
+        cameras: List[Cameras] = []
+        lidars: List[Lidar] = []
+
+        for frame_idx in range(-scene_metadata.num_history_iterations, 1):
+            ego_statuses.append(cls.map_agent_api_to_navsim_ego_status(agent_api, frame_idx))
+            cameras.append(cls.map_agent_api_to_navsim_cameras(agent_api, frame_idx))
+            lidars.append(cls.map_agent_api_to_navsim_lidar(agent_api, frame_idx))
         return AgentInput(ego_statuses, cameras, lidars)
 
 @dataclass
