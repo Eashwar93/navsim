@@ -62,11 +62,15 @@ dependencies = [
     "protobuf==4.25.3",
     "notebook",
     "timm",
-    "py123d"
+    "py123d",
+    "nav123d"
 ]
 
 [project.urls]
 Repository = "https://github.com/autonomousvision/navsim"
+
+[tool.uv.sources]
+nav123d = { git = "https://github.com/AndrBaer/nav123d"}
 
 [tool.setuptools.packages.find]
 where = ["."]
