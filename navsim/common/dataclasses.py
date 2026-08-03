@@ -272,8 +272,7 @@ class AgentInput:
         ego_pose = ego_state_se3.center_se3.array
         ego_velocity = dynamic_state_se3.velocity_2d.array
         ego_acceleration = dynamic_state_se3.acceleration_2d.array
-        driving_command = np.zeros(4, dtype=np.float32)
-        driving_command[1] = 1.0  # index 0: left, 1: straight, 2: left, 3: unknown
+        driving_command = agent_api.get_driving_command_heuristic()
 
         return EgoStatus(
             ego_pose=ego_pose,
