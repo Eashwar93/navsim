@@ -313,18 +313,17 @@ class AgentInput:
         )
 
     @classmethod
-    def from_scene_api_list(
+    def from_scene_api(
         cls,
-        scene_api_list: List[SceneAPI],
+        scene_api: SceneAPI,
         ) -> AgentInput:
         """
-        Load agent input from scene API list.
-        :param scene_api_list: list of scene APIs (in logs).
+        Load agent input from scene API.
+        :param scene_api: scene API object
         :return: agent input dataclass
         """
-        # assert len(scene_api_list) > 0, "Scene list is empty!"
-        log_dir = scene_api_list._log_dir
-        scene_metadata = scene_api_list.get_scene_metadata()
+        log_dir = scene_api._log_dir
+        scene_metadata = scene_api.get_scene_metadata()
 
         agent_api = ArrowSensorAgentAPI(log_dir=log_dir, scene_metadata=scene_metadata)
 
