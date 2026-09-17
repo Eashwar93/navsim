@@ -264,7 +264,8 @@ class AgentInput:
     def map_agent_api_to_navsim_ego_status(cls, agent_api: ArrowSensorAgentAPI, frame_idx: int) -> EgoStatus:
         """
         Map to navsim ego status using Py123D agent API.
-        :param ego_status_123D: 123D ego status object
+        :param agent_api: Py123D agent API
+        :param frame_idx: frame index
         :return: navsim ego status
         """
         ego_state_se3 = agent_api.get_modality_at_iteration(frame_idx, ModalityType.EGO_STATE_SE3)
@@ -283,43 +284,52 @@ class AgentInput:
         )
 
     @classmethod
-    def map_agent_api_to_navsim_cameras(cls, agent_api: ArrowSensorAgentAPI, frame_idx: int) -> Cameras:
+    def map_agent_api_to_navsim_cameras(cls, agent_api: ArrowSensorAgentAPI, frame_idx: int, sensor_config: Optional[SensorConfig]) -> Cameras:
         """
         Map to navsim cameras using Py123D agent API.
-        :param camera_123D: 123D Camera object
+        :param agent_api: Py123D agent API
+        :param frame_idx: frame index
+        :param sensor_config: sensor configuration (optional, used to determine which sensors to load)
         :return: navsim cameras
         """
+        if sensor_config is None:
+            sensor_config = SensorConfig().build_all_sensors()
         return Cameras(
-            cam_f0=agent_api.get_modality_at_iteration(frame_idx, ModalityType.CAMERA, CameraID.PCAM_F0),
-            cam_l0=agent_api.get_modality_at_iteration(frame_idx, ModalityType.CAMERA, CameraID.PCAM_L0),
-            cam_l1=agent_api.get_modality_at_iteration(frame_idx, ModalityType.CAMERA, CameraID.PCAM_L1),
-            cam_l2=agent_api.get_modality_at_iteration(frame_idx, ModalityType.CAMERA, CameraID.PCAM_L2),
-            cam_r0=agent_api.get_modality_at_iteration(frame_idx, ModalityType.CAMERA, CameraID.PCAM_R0),
-            cam_r1=agent_api.get_modality_at_iteration(frame_idx, ModalityType.CAMERA, CameraID.PCAM_R1),
-            cam_r2=agent_api.get_modality_at_iteration(frame_idx, ModalityType.CAMERA, CameraID.PCAM_R2),
-            cam_b0=agent_api.get_modality_at_iteration(frame_idx, ModalityType.CAMERA, CameraID.PCAM_B0),
+            cam_f0=agent_api.get_modality_at_iteration(frame_idx, ModalityType.CAMERA, CameraID.PCAM_F0) if sensor_config.cam_f0 else None,
+            cam_l0=agent_api.get_modality_at_iteration(frame_idx, ModalityType.CAMERA, CameraID.PCAM_L0) if sensor_config.cam_l0 else None,
+            cam_l1=agent_api.get_modality_at_iteration(frame_idx, ModalityType.CAMERA, CameraID.PCAM_L1) if sensor_config.cam_l1 else None,
+            cam_l2=agent_api.get_modality_at_iteration(frame_idx, ModalityType.CAMERA, CameraID.PCAM_L2) if sensor_config.cam_l2 else None,
+            cam_r0=agent_api.get_modality_at_iteration(frame_idx, ModalityType.CAMERA, CameraID.PCAM_R0) if sensor_config.cam_r0 else None,
+            cam_r1=agent_api.get_modality_at_iteration(frame_idx, ModalityType.CAMERA, CameraID.PCAM_R1) if sensor_config.cam_r1 else None,
+            cam_r2=agent_api.get_modality_at_iteration(frame_idx, ModalityType.CAMERA, CameraID.PCAM_R2) if sensor_config.cam_r2 else None,
+            cam_b0=agent_api.get_modality_at_iteration(frame_idx, ModalityType.CAMERA, CameraID.PCAM_B0) if sensor_config.cam_b0 else None,
         )
 
     @classmethod
-    def map_agent_api_to_navsim_lidar(cls, agent_api: ArrowSensorAgentAPI, frame_idx: int) -> Lidar:
+    def map_agent_api_to_navsim_lidar(cls, agent_api: ArrowSensorAgentAPI, frame_idx: int, sensor_config: Optional[SensorConfig]) -> Lidar:
         """
         Map to navsim lidar using Py123D agent API.
         :param agent_api: Py123D agent API
         :param frame_idx: frame index
+        :param sensor_config: sensor configuration (optional, used to determine which sensors to load)
         :return: navsim lidar
         """
+        if sensor_config is None:
+            sensor_config = SensorConfig().build_all_sensors()
         return Lidar(
-            lidar_pc=agent_api.get_modality_at_iteration(frame_idx, ModalityType.LIDAR, LidarID.LIDAR_MERGED)
+            lidar_pc=agent_api.get_modality_at_iteration(frame_idx, ModalityType.LIDAR, LidarID.LIDAR_MERGED) if sensor_config.lidar_pc else None
         )
 
     @classmethod
     def from_scene_api(
         cls,
         scene_api: SceneAPI,
-        ) -> AgentInput:
+        sensor_config: Optional[SensorConfig] = None,
+    ) -> AgentInput:
         """
         Load agent input from scene API.
         :param scene_api: scene API object
+        :param sensor_config: sensor configuration (optional, used to determine which sensors to load)
         :return: agent input dataclass
         """
         log_dir = scene_api._log_dir
@@ -333,8 +343,8 @@ class AgentInput:
 
         for frame_idx in range(-scene_metadata.num_history_iterations, 1):
             ego_statuses.append(cls.map_agent_api_to_navsim_ego_status(agent_api, frame_idx))
-            cameras.append(cls.map_agent_api_to_navsim_cameras(agent_api, frame_idx))
-            lidars.append(cls.map_agent_api_to_navsim_lidar(agent_api, frame_idx))
+            cameras.append(cls.map_agent_api_to_navsim_cameras(agent_api, frame_idx, sensor_config))
+            lidars.append(cls.map_agent_api_to_navsim_lidar(agent_api, frame_idx, sensor_config))
         return AgentInput(ego_statuses, cameras, lidars)
 
 @dataclass
